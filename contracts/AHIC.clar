@@ -13,15 +13,24 @@
 (define-constant ERR_INVALID_PROVIDER (err u106))
 (define-constant ERR_POLICY_NOT_ACTIVE (err u107))
 (define-constant ERR_CLAIM_AMOUNT_EXCEEDED (err u108))
+(define-constant ERR_APPEAL_NOT_FOUND (err u109))
+(define-constant ERR_APPEAL_ALREADY_EXISTS (err u110))
+(define-constant ERR_APPEAL_NOT_REVIEWABLE (err u111))
+(define-constant ERR_APPEAL_EXPIRED (err u112))
+(define-constant ERR_INSUFFICIENT_APPEAL_FEE (err u113))
 
 (define-constant CLAIM_EXPIRY_BLOCKS u1008)
 (define-constant MIN_CLAIM_AMOUNT u1000000)
 (define-constant MAX_CLAIM_AMOUNT u100000000)
 (define-constant FRAUD_THRESHOLD u5)
+(define-constant APPEAL_FEE u5000000)
+(define-constant APPEAL_REVIEW_BLOCKS u144)
 
 (define-data-var claim-counter uint u0)
 (define-data-var total-paid uint u0)
 (define-data-var contract-balance uint u0)
+(define-data-var appeal-counter uint u0)
+(define-data-var appeal-fees-collected uint u0)
 
 (define-map policies
   { policy-id: uint }
@@ -68,6 +77,25 @@
 (define-map policy-claims-total
   { policy-id: uint }
   { total-claimed: uint }
+)
+
+(define-map appeals
+  { appeal-id: uint }
+  {
+    claim-id: uint,
+    appellant: principal,
+    appeal-fee: uint,
+    submitted-block: uint,
+    status: (string-ascii 20),
+    reviewer: (optional principal),
+    reviewed-block: (optional uint),
+    additional-payout: uint
+  }
+)
+
+(define-map claim-appeals
+  { claim-id: uint }
+  { appeal-id: uint }
 )
 
 (define-public (register-policy (premium uint) (coverage-limit uint) (deductible uint) (duration-blocks uint))
@@ -280,7 +308,9 @@
   {
     total-claims: (var-get claim-counter),
     total-paid: (var-get total-paid),
-    contract-balance: (var-get contract-balance)
+    contract-balance: (var-get contract-balance),
+    total-appeals: (var-get appeal-counter),
+    appeal-fees-collected: (var-get appeal-fees-collected)
   }
 )
 
@@ -414,6 +444,114 @@
   )
 )
 
+(define-public (submit-appeal (claim-id uint))
+  (let
+    (
+      (claim-data (unwrap! (map-get? claims { claim-id: claim-id }) ERR_CLAIM_NOT_FOUND))
+      (policy-data (unwrap! (map-get? policies { policy-id: (get policy-id claim-data) }) ERR_INVALID_CLAIM))
+      (appeal-id (+ (var-get appeal-counter) u1))
+      (existing-appeal (map-get? claim-appeals { claim-id: claim-id }))
+    )
+    (asserts! (is-eq tx-sender (get claimant claim-data)) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq (get status claim-data) "paid") (is-eq (get status claim-data) "verified")) ERR_INVALID_CLAIM)
+    (asserts! (is-none existing-appeal) ERR_APPEAL_ALREADY_EXISTS)
+    
+    (try! (stx-transfer? APPEAL_FEE tx-sender (as-contract tx-sender)))
+    
+    (map-set appeals
+      { appeal-id: appeal-id }
+      {
+        claim-id: claim-id,
+        appellant: tx-sender,
+        appeal-fee: APPEAL_FEE,
+        submitted-block: stacks-block-height,
+        status: "pending",
+        reviewer: none,
+        reviewed-block: none,
+        additional-payout: u0
+      }
+    )
+    
+    (map-set claim-appeals
+      { claim-id: claim-id }
+      { appeal-id: appeal-id }
+    )
+    
+    (var-set appeal-counter appeal-id)
+    (var-set appeal-fees-collected (+ (var-get appeal-fees-collected) APPEAL_FEE))
+    (ok appeal-id)
+  )
+)
+
+(define-public (review-appeal (appeal-id uint) (approved bool) (additional-payout uint))
+  (let
+    (
+      (appeal-data (unwrap! (map-get? appeals { appeal-id: appeal-id }) ERR_APPEAL_NOT_FOUND))
+      (blocks-elapsed (- stacks-block-height (get submitted-block appeal-data)))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status appeal-data) "pending") ERR_APPEAL_NOT_REVIEWABLE)
+    (asserts! (<= blocks-elapsed APPEAL_REVIEW_BLOCKS) ERR_APPEAL_EXPIRED)
+    
+    (map-set appeals
+      { appeal-id: appeal-id }
+      (merge appeal-data {
+        status: (if approved "approved" "rejected"),
+        reviewer: (some tx-sender),
+        reviewed-block: (some stacks-block-height),
+        additional-payout: (if approved additional-payout u0)
+      })
+    )
+    
+    (if approved
+      (begin
+        (var-set contract-balance (- (var-get contract-balance) additional-payout))
+        (as-contract (stx-transfer? additional-payout tx-sender (get appellant appeal-data)))
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (finalize-appeal (appeal-id uint))
+  (let
+    (
+      (appeal-data (unwrap! (map-get? appeals { appeal-id: appeal-id }) ERR_APPEAL_NOT_FOUND))
+      (blocks-elapsed (- stacks-block-height (get submitted-block appeal-data)))
+      (claim-data (unwrap! (map-get? claims { claim-id: (get claim-id appeal-data) }) ERR_CLAIM_NOT_FOUND))
+      (refund-amount (get appeal-fee appeal-data))
+    )
+    (asserts! (is-eq (get status appeal-data) "pending") ERR_APPEAL_NOT_REVIEWABLE)
+    (asserts! (> blocks-elapsed APPEAL_REVIEW_BLOCKS) ERR_APPEAL_NOT_REVIEWABLE)
+    
+    (map-set appeals
+      { appeal-id: appeal-id }
+      (merge appeal-data {
+        status: "auto-approved",
+        reviewer: none,
+        reviewed-block: (some stacks-block-height),
+        additional-payout: refund-amount
+      })
+    )
+    
+    (var-set contract-balance (- (var-get contract-balance) refund-amount))
+    (as-contract (stx-transfer? refund-amount tx-sender (get appellant appeal-data)))
+  )
+)
+
+(define-public (withdraw-appeal-fees)
+  (let
+    (
+      (fees-amount (var-get appeal-fees-collected))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> fees-amount u0) ERR_INSUFFICIENT_FUNDS)
+    
+    (var-set appeal-fees-collected u0)
+    (as-contract (stx-transfer? fees-amount tx-sender CONTRACT_OWNER))
+  )
+)
+
 (define-read-only (get-active-policies-count)
   (let
     (
@@ -441,5 +579,33 @@
       claims-processed: u0
     })
     ERR_INVALID_PROVIDER
+  )
+)
+
+(define-read-only (get-appeal (appeal-id uint))
+  (map-get? appeals { appeal-id: appeal-id })
+)
+
+(define-read-only (get-claim-appeal (claim-id uint))
+  (map-get? claim-appeals { claim-id: claim-id })
+)
+
+(define-read-only (get-appeal-stats)
+  {
+    total-appeals: (var-get appeal-counter),
+    fees-collected: (var-get appeal-fees-collected)
+  }
+)
+
+(define-read-only (is-appeal-expired (appeal-id uint))
+  (match (map-get? appeals { appeal-id: appeal-id })
+    appeal-data
+    (let
+      (
+        (blocks-elapsed (- stacks-block-height (get submitted-block appeal-data)))
+      )
+      (> blocks-elapsed APPEAL_REVIEW_BLOCKS)
+    )
+    false
   )
 )
