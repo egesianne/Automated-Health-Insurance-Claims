@@ -18,6 +18,9 @@
 (define-constant ERR_APPEAL_NOT_REVIEWABLE (err u111))
 (define-constant ERR_APPEAL_EXPIRED (err u112))
 (define-constant ERR_INSUFFICIENT_APPEAL_FEE (err u113))
+(define-constant ERR_PREMIUM_OVERDUE (err u114))
+(define-constant ERR_INVALID_PAYMENT_AMOUNT (err u115))
+(define-constant ERR_PREMIUM_ALREADY_PAID (err u116))
 
 (define-constant CLAIM_EXPIRY_BLOCKS u1008)
 (define-constant MIN_CLAIM_AMOUNT u1000000)
@@ -25,12 +28,17 @@
 (define-constant FRAUD_THRESHOLD u5)
 (define-constant APPEAL_FEE u5000000)
 (define-constant APPEAL_REVIEW_BLOCKS u144)
+(define-constant GRACE_PERIOD_BLOCKS u720)
+(define-constant BASE_PREMIUM_RATE u1000)
+(define-constant MAX_RISK_MULTIPLIER u300)
+(define-constant PAYMENT_FREQUENCY_BLOCKS u4320)
 
 (define-data-var claim-counter uint u0)
 (define-data-var total-paid uint u0)
 (define-data-var contract-balance uint u0)
 (define-data-var appeal-counter uint u0)
 (define-data-var appeal-fees-collected uint u0)
+(define-data-var premium-payment-counter uint u0)
 
 (define-map policies
   { policy-id: uint }
@@ -40,7 +48,13 @@
     coverage-limit: uint,
     deductible: uint,
     active: bool,
-    expiry-block: uint
+    expiry-block: uint,
+    risk-score: uint,
+    calculated-premium: uint,
+    last-payment-block: uint,
+    next-payment-due: uint,
+    grace-period-end: uint,
+    payment-overdue: bool
   }
 )
 
@@ -98,6 +112,27 @@
   { appeal-id: uint }
 )
 
+(define-map premium-payments
+  { payment-id: uint }
+  {
+    policy-id: uint,
+    payer: principal,
+    amount: uint,
+    payment-block: uint,
+    payment-type: (string-ascii 20)
+  }
+)
+
+(define-map risk-factors
+  { policy-id: uint }
+  {
+    age-bracket: uint,
+    claim-history-score: uint,
+    provider-risk-score: uint,
+    total-risk-score: uint
+  }
+)
+
 (define-public (register-policy (premium uint) (coverage-limit uint) (deductible uint) (duration-blocks uint))
   (let
     (
@@ -112,7 +147,13 @@
         coverage-limit: coverage-limit,
         deductible: deductible,
         active: true,
-        expiry-block: expiry-block
+        expiry-block: expiry-block,
+        risk-score: u100,
+        calculated-premium: premium,
+        last-payment-block: stacks-block-height,
+        next-payment-due: (+ stacks-block-height PAYMENT_FREQUENCY_BLOCKS),
+        grace-period-end: (+ stacks-block-height PAYMENT_FREQUENCY_BLOCKS GRACE_PERIOD_BLOCKS),
+        payment-overdue: false
       }
     )
     (var-set claim-counter policy-id)
@@ -608,4 +649,203 @@
     )
     false
   )
+)
+
+(define-public (calculate-risk-premium (policy-id uint) (age-bracket uint))
+  (let
+    (
+      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_CLAIM))
+      (current-claims (default-to { total-claimed: u0 } (map-get? policy-claims-total { policy-id: policy-id })))
+      (user-claims (default-to { count: u0 } (map-get? user-claims-count { user: (get holder policy-data) })))
+      (raw-claim-score (* (get count user-claims) u10))
+      (claim-risk-score (if (> raw-claim-score u50) u50 raw-claim-score))
+      (raw-age-score (* age-bracket u5))
+      (age-risk-score (if (> raw-age-score u30) u30 raw-age-score))
+      (total-risk-score (+ claim-risk-score age-risk-score))
+      (capped-risk-score (if (> total-risk-score MAX_RISK_MULTIPLIER) MAX_RISK_MULTIPLIER total-risk-score))
+      (risk-multiplier (+ u100 capped-risk-score))
+      (base-premium (get premium policy-data))
+      (calculated-premium (/ (* base-premium risk-multiplier) u100))
+    )
+    (asserts! (is-eq tx-sender (get holder policy-data)) ERR_UNAUTHORIZED)
+    
+    (map-set risk-factors
+      { policy-id: policy-id }
+      {
+        age-bracket: age-bracket,
+        claim-history-score: claim-risk-score,
+        provider-risk-score: u0,
+        total-risk-score: total-risk-score
+      }
+    )
+    
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy-data {
+        risk-score: total-risk-score,
+        calculated-premium: calculated-premium
+      })
+    )
+    
+    (ok calculated-premium)
+  )
+)
+
+(define-public (pay-premium (policy-id uint))
+  (let
+    (
+      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_CLAIM))
+      (payment-id (+ (var-get premium-payment-counter) u1))
+      (premium-amount (get calculated-premium policy-data))
+      (current-block stacks-block-height)
+      (next-payment-due (+ current-block PAYMENT_FREQUENCY_BLOCKS))
+      (grace-period-end (+ next-payment-due GRACE_PERIOD_BLOCKS))
+    )
+    (asserts! (is-eq tx-sender (get holder policy-data)) ERR_UNAUTHORIZED)
+    (asserts! (get active policy-data) ERR_POLICY_NOT_ACTIVE)
+    (asserts! (>= current-block (get next-payment-due policy-data)) ERR_PREMIUM_ALREADY_PAID)
+    
+    (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set premium-payments
+      { payment-id: payment-id }
+      {
+        policy-id: policy-id,
+        payer: tx-sender,
+        amount: premium-amount,
+        payment-block: current-block,
+        payment-type: "regular"
+      }
+    )
+    
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy-data {
+        last-payment-block: current-block,
+        next-payment-due: next-payment-due,
+        grace-period-end: grace-period-end,
+        payment-overdue: false
+      })
+    )
+    
+    (var-set premium-payment-counter payment-id)
+    (var-set contract-balance (+ (var-get contract-balance) premium-amount))
+    (ok payment-id)
+  )
+)
+
+(define-public (check-payment-status (policy-id uint))
+  (let
+    (
+      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_CLAIM))
+      (current-block stacks-block-height)
+      (payment-due (get next-payment-due policy-data))
+      (grace-end (get grace-period-end policy-data))
+      (is-overdue (> current-block grace-end))
+    )
+    (if is-overdue
+      (begin
+        (map-set policies
+          { policy-id: policy-id }
+          (merge policy-data { payment-overdue: true, active: false })
+        )
+        (ok "overdue")
+      )
+      (if (> current-block payment-due)
+        (ok "grace-period")
+        (ok "current")
+      )
+    )
+  )
+)
+
+(define-public (reinstate-policy (policy-id uint))
+  (let
+    (
+      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_CLAIM))
+      (premium-amount (get calculated-premium policy-data))
+      (reinstatement-fee (/ premium-amount u10))
+      (total-amount (+ premium-amount reinstatement-fee))
+      (current-block stacks-block-height)
+      (payment-id (+ (var-get premium-payment-counter) u1))
+    )
+    (asserts! (is-eq tx-sender (get holder policy-data)) ERR_UNAUTHORIZED)
+    (asserts! (get payment-overdue policy-data) ERR_INVALID_CLAIM)
+    
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set premium-payments
+      { payment-id: payment-id }
+      {
+        policy-id: policy-id,
+        payer: tx-sender,
+        amount: total-amount,
+        payment-block: current-block,
+        payment-type: "reinstatement"
+      }
+    )
+    
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy-data {
+        active: true,
+        payment-overdue: false,
+        last-payment-block: current-block,
+        next-payment-due: (+ current-block PAYMENT_FREQUENCY_BLOCKS),
+        grace-period-end: (+ current-block PAYMENT_FREQUENCY_BLOCKS GRACE_PERIOD_BLOCKS)
+      })
+    )
+    
+    (var-set premium-payment-counter payment-id)
+    (var-set contract-balance (+ (var-get contract-balance) total-amount))
+    (ok payment-id)
+  )
+)
+
+(define-read-only (get-premium-calculation (policy-id uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy-data
+    (match (map-get? risk-factors { policy-id: policy-id })
+      risk-data
+      (ok {
+        base-premium: (get premium policy-data),
+        calculated-premium: (get calculated-premium policy-data),
+        risk-score: (get risk-score policy-data),
+        age-bracket: (get age-bracket risk-data),
+        claim-history-score: (get claim-history-score risk-data)
+      })
+      (ok {
+        base-premium: (get premium policy-data),
+        calculated-premium: (get calculated-premium policy-data),
+        risk-score: (get risk-score policy-data),
+        age-bracket: u0,
+        claim-history-score: u0
+      })
+    )
+    ERR_INVALID_CLAIM
+  )
+)
+
+(define-read-only (get-payment-status (policy-id uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy-data
+    (ok {
+      last-payment-block: (get last-payment-block policy-data),
+      next-payment-due: (get next-payment-due policy-data),
+      grace-period-end: (get grace-period-end policy-data),
+      payment-overdue: (get payment-overdue policy-data),
+      blocks-until-due: (if (> (get next-payment-due policy-data) stacks-block-height)
+                          (- (get next-payment-due policy-data) stacks-block-height)
+                          u0)
+    })
+    ERR_INVALID_CLAIM
+  )
+)
+
+(define-read-only (get-premium-payment (payment-id uint))
+  (map-get? premium-payments { payment-id: payment-id })
+)
+
+(define-read-only (get-risk-factors (policy-id uint))
+  (map-get? risk-factors { policy-id: policy-id })
 )
