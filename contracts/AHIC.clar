@@ -485,6 +485,21 @@
   )
 )
 
+(define-public (transfer-policy (policy-id uint) (new-holder principal))
+  (let
+    (
+      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_CLAIM))
+    )
+    (asserts! (is-eq tx-sender (get holder policy-data)) ERR_UNAUTHORIZED)
+    (asserts! (get active policy-data) ERR_POLICY_NOT_ACTIVE)
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy-data { holder: new-holder })
+    )
+    (ok true)
+  )
+)
+
 (define-public (submit-appeal (claim-id uint))
   (let
     (
