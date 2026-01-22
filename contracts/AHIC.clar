@@ -21,6 +21,12 @@
 (define-constant ERR_PREMIUM_OVERDUE (err u114))
 (define-constant ERR_INVALID_PAYMENT_AMOUNT (err u115))
 (define-constant ERR_PREMIUM_ALREADY_PAID (err u116))
+(define-constant ERR_BENEFICIARY_NOT_FOUND (err u117))
+(define-constant ERR_BENEFICIARY_ALREADY_EXISTS (err u118))
+(define-constant ERR_MAX_BENEFICIARIES_REACHED (err u119))
+(define-constant ERR_INVALID_BENEFICIARY (err u120))
+
+(define-constant MAX_BENEFICIARIES u5)
 
 (define-constant CLAIM_EXPIRY_BLOCKS u1008)
 (define-constant MIN_CLAIM_AMOUNT u1000000)
@@ -131,6 +137,20 @@
     provider-risk-score: uint,
     total-risk-score: uint
   }
+)
+
+(define-map policy-beneficiaries
+  { policy-id: uint, beneficiary: principal }
+  {
+    relationship: (string-ascii 30),
+    added-block: uint,
+    active: bool
+  }
+)
+
+(define-map beneficiary-count
+  { policy-id: uint }
+  { count: uint }
 )
 
 (define-public (register-policy (premium uint) (coverage-limit uint) (deductible uint) (duration-blocks uint))
@@ -863,4 +883,114 @@
 
 (define-read-only (get-risk-factors (policy-id uint))
   (map-get? risk-factors { policy-id: policy-id })
+)
+
+(define-public (add-beneficiary (policy-id uint) (beneficiary principal) (relationship (string-ascii 30)))
+  (let
+    (
+      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_CLAIM))
+      (current-count (default-to { count: u0 } (map-get? beneficiary-count { policy-id: policy-id })))
+      (existing-beneficiary (map-get? policy-beneficiaries { policy-id: policy-id, beneficiary: beneficiary }))
+    )
+    (asserts! (is-eq tx-sender (get holder policy-data)) ERR_UNAUTHORIZED)
+    (asserts! (get active policy-data) ERR_POLICY_NOT_ACTIVE)
+    (asserts! (not (is-eq beneficiary tx-sender)) ERR_INVALID_BENEFICIARY)
+    (asserts! (< (get count current-count) MAX_BENEFICIARIES) ERR_MAX_BENEFICIARIES_REACHED)
+    (asserts! (is-none existing-beneficiary) ERR_BENEFICIARY_ALREADY_EXISTS)
+    
+    (map-set policy-beneficiaries
+      { policy-id: policy-id, beneficiary: beneficiary }
+      {
+        relationship: relationship,
+        added-block: stacks-block-height,
+        active: true
+      }
+    )
+    
+    (map-set beneficiary-count
+      { policy-id: policy-id }
+      { count: (+ (get count current-count) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-beneficiary (policy-id uint) (beneficiary principal))
+  (let
+    (
+      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_CLAIM))
+      (beneficiary-data (unwrap! (map-get? policy-beneficiaries { policy-id: policy-id, beneficiary: beneficiary }) ERR_BENEFICIARY_NOT_FOUND))
+      (current-count (default-to { count: u0 } (map-get? beneficiary-count { policy-id: policy-id })))
+    )
+    (asserts! (is-eq tx-sender (get holder policy-data)) ERR_UNAUTHORIZED)
+    
+    (map-set policy-beneficiaries
+      { policy-id: policy-id, beneficiary: beneficiary }
+      (merge beneficiary-data { active: false })
+    )
+    
+    (map-set beneficiary-count
+      { policy-id: policy-id }
+      { count: (- (get count current-count) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (submit-claim-as-beneficiary (policy-id uint) (provider principal) (amount uint) (diagnosis-code (string-ascii 20)) (treatment-date uint))
+  (let
+    (
+      (claim-id (+ (var-get claim-counter) u1))
+      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_CLAIM))
+      (beneficiary-data (unwrap! (map-get? policy-beneficiaries { policy-id: policy-id, beneficiary: tx-sender }) ERR_BENEFICIARY_NOT_FOUND))
+      (provider-data (unwrap! (map-get? medical-providers { provider: provider }) ERR_INVALID_PROVIDER))
+      (user-claims (default-to { count: u0 } (map-get? user-claims-count { user: (get holder policy-data) })))
+    )
+    (asserts! (get active beneficiary-data) ERR_BENEFICIARY_NOT_FOUND)
+    (asserts! (get verified provider-data) ERR_INVALID_PROVIDER)
+    (asserts! (get active policy-data) ERR_POLICY_NOT_ACTIVE)
+    (asserts! (>= (get expiry-block policy-data) stacks-block-height) ERR_POLICY_NOT_ACTIVE)
+    (asserts! (and (>= amount MIN_CLAIM_AMOUNT) (<= amount MAX_CLAIM_AMOUNT)) ERR_INVALID_CLAIM)
+    (asserts! (< (get fraud-score provider-data) FRAUD_THRESHOLD) ERR_INVALID_PROVIDER)
+    
+    (map-set claims
+      { claim-id: claim-id }
+      {
+        policy-id: policy-id,
+        claimant: (get holder policy-data),
+        provider: provider,
+        amount: amount,
+        diagnosis-code: diagnosis-code,
+        treatment-date: treatment-date,
+        submitted-block: stacks-block-height,
+        status: "pending",
+        verified: false
+      }
+    )
+    
+    (map-set user-claims-count
+      { user: (get holder policy-data) }
+      { count: (+ (get count user-claims) u1) }
+    )
+    
+    (var-set claim-counter claim-id)
+    (ok claim-id)
+  )
+)
+
+(define-read-only (get-beneficiary (policy-id uint) (beneficiary principal))
+  (map-get? policy-beneficiaries { policy-id: policy-id, beneficiary: beneficiary })
+)
+
+(define-read-only (get-beneficiary-count (policy-id uint))
+  (default-to { count: u0 } (map-get? beneficiary-count { policy-id: policy-id }))
+)
+
+(define-read-only (is-beneficiary (policy-id uint) (beneficiary principal))
+  (match (map-get? policy-beneficiaries { policy-id: policy-id, beneficiary: beneficiary })
+    beneficiary-data (get active beneficiary-data)
+    false
+  )
 )
