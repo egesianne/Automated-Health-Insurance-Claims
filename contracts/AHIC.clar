@@ -28,6 +28,8 @@
 (define-constant ERR_PREAUTH_NOT_FOUND (err u121))
 (define-constant ERR_PREAUTH_EXPIRED (err u122))
 (define-constant ERR_PREAUTH_ALREADY_USED (err u123))
+(define-constant ERR_CLAIM_ALREADY_REJECTED (err u124))
+(define-constant ERR_REJECTION_NOT_FOUND (err u125))
 
 (define-constant MAX_BENEFICIARIES u5)
 
@@ -50,6 +52,7 @@
 (define-data-var appeal-fees-collected uint u0)
 (define-data-var premium-payment-counter uint u0)
 (define-data-var preauth-counter uint u0)
+(define-data-var rejection-counter uint u0)
 
 (define-map policies
   { policy-id: uint }
@@ -176,6 +179,22 @@
 (define-map policy-preauths
   { policy-id: uint, preauth-id: uint }
   { active: bool }
+)
+
+(define-map claim-rejections
+  { rejection-id: uint }
+  {
+    claim-id: uint,
+    rejected-by: principal,
+    reason-code: (string-ascii 10),
+    reason-detail: (string-ascii 100),
+    rejected-block: uint
+  }
+)
+
+(define-map claim-rejection-lookup
+  { claim-id: uint }
+  { rejection-id: uint }
 )
 
 (define-public (register-policy (premium uint) (coverage-limit uint) (deductible uint) (duration-blocks uint))
@@ -1121,4 +1140,56 @@
     )
     false
   )
+)
+
+(define-public (reject-claim (claim-id uint) (reason-code (string-ascii 10)) (reason-detail (string-ascii 100)))
+  (let
+    (
+      (claim-data (unwrap! (map-get? claims { claim-id: claim-id }) ERR_CLAIM_NOT_FOUND))
+      (rejection-id (+ (var-get rejection-counter) u1))
+      (existing-rejection (map-get? claim-rejection-lookup { claim-id: claim-id }))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status claim-data) "pending") ERR_CLAIM_ALREADY_PROCESSED)
+    (asserts! (is-none existing-rejection) ERR_CLAIM_ALREADY_REJECTED)
+
+    (map-set claims
+      { claim-id: claim-id }
+      (merge claim-data { status: "rejected" })
+    )
+
+    (map-set claim-rejections
+      { rejection-id: rejection-id }
+      {
+        claim-id: claim-id,
+        rejected-by: tx-sender,
+        reason-code: reason-code,
+        reason-detail: reason-detail,
+        rejected-block: stacks-block-height
+      }
+    )
+
+    (map-set claim-rejection-lookup
+      { claim-id: claim-id }
+      { rejection-id: rejection-id }
+    )
+
+    (var-set rejection-counter rejection-id)
+    (ok rejection-id)
+  )
+)
+
+(define-read-only (get-claim-rejection (claim-id uint))
+  (match (map-get? claim-rejection-lookup { claim-id: claim-id })
+    lookup-data (map-get? claim-rejections { rejection-id: (get rejection-id lookup-data) })
+    none
+  )
+)
+
+(define-read-only (get-rejection-detail (rejection-id uint))
+  (map-get? claim-rejections { rejection-id: rejection-id })
+)
+
+(define-read-only (is-claim-rejected (claim-id uint))
+  (is-some (map-get? claim-rejection-lookup { claim-id: claim-id }))
 )
