@@ -25,6 +25,9 @@
 (define-constant ERR_BENEFICIARY_ALREADY_EXISTS (err u118))
 (define-constant ERR_MAX_BENEFICIARIES_REACHED (err u119))
 (define-constant ERR_INVALID_BENEFICIARY (err u120))
+(define-constant ERR_PREAUTH_NOT_FOUND (err u121))
+(define-constant ERR_PREAUTH_EXPIRED (err u122))
+(define-constant ERR_PREAUTH_ALREADY_USED (err u123))
 
 (define-constant MAX_BENEFICIARIES u5)
 
@@ -38,6 +41,7 @@
 (define-constant BASE_PREMIUM_RATE u1000)
 (define-constant MAX_RISK_MULTIPLIER u300)
 (define-constant PAYMENT_FREQUENCY_BLOCKS u4320)
+(define-constant PREAUTH_EXPIRY_BLOCKS u2016)
 
 (define-data-var claim-counter uint u0)
 (define-data-var total-paid uint u0)
@@ -45,6 +49,7 @@
 (define-data-var appeal-counter uint u0)
 (define-data-var appeal-fees-collected uint u0)
 (define-data-var premium-payment-counter uint u0)
+(define-data-var preauth-counter uint u0)
 
 (define-map policies
   { policy-id: uint }
@@ -151,6 +156,26 @@
 (define-map beneficiary-count
   { policy-id: uint }
   { count: uint }
+)
+
+(define-map preauthorizations
+  { preauth-id: uint }
+  {
+    policy-id: uint,
+    requester: principal,
+    provider: principal,
+    estimated-amount: uint,
+    diagnosis-code: (string-ascii 20),
+    requested-block: uint,
+    status: (string-ascii 20),
+    approved-amount: uint,
+    reviewed-by: (optional principal)
+  }
+)
+
+(define-map policy-preauths
+  { policy-id: uint, preauth-id: uint }
+  { active: bool }
 )
 
 (define-public (register-policy (premium uint) (coverage-limit uint) (deductible uint) (duration-blocks uint))
@@ -991,6 +1016,109 @@
 (define-read-only (is-beneficiary (policy-id uint) (beneficiary principal))
   (match (map-get? policy-beneficiaries { policy-id: policy-id, beneficiary: beneficiary })
     beneficiary-data (get active beneficiary-data)
+    false
+  )
+)
+
+(define-public (request-preauthorization (policy-id uint) (provider principal) (estimated-amount uint) (diagnosis-code (string-ascii 20)))
+  (let
+    (
+      (preauth-id (+ (var-get preauth-counter) u1))
+      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_CLAIM))
+      (provider-data (unwrap! (map-get? medical-providers { provider: provider }) ERR_INVALID_PROVIDER))
+    )
+    (asserts! (is-eq tx-sender (get holder policy-data)) ERR_UNAUTHORIZED)
+    (asserts! (get active policy-data) ERR_POLICY_NOT_ACTIVE)
+    (asserts! (get verified provider-data) ERR_INVALID_PROVIDER)
+    (asserts! (and (>= estimated-amount MIN_CLAIM_AMOUNT) (<= estimated-amount MAX_CLAIM_AMOUNT)) ERR_INVALID_CLAIM)
+
+    (map-set preauthorizations
+      { preauth-id: preauth-id }
+      {
+        policy-id: policy-id,
+        requester: tx-sender,
+        provider: provider,
+        estimated-amount: estimated-amount,
+        diagnosis-code: diagnosis-code,
+        requested-block: stacks-block-height,
+        status: "pending",
+        approved-amount: u0,
+        reviewed-by: none
+      }
+    )
+
+    (map-set policy-preauths
+      { policy-id: policy-id, preauth-id: preauth-id }
+      { active: true }
+    )
+
+    (var-set preauth-counter preauth-id)
+    (ok preauth-id)
+  )
+)
+
+(define-public (approve-preauthorization (preauth-id uint) (approved-amount uint))
+  (let
+    (
+      (preauth-data (unwrap! (map-get? preauthorizations { preauth-id: preauth-id }) ERR_PREAUTH_NOT_FOUND))
+      (blocks-elapsed (- stacks-block-height (get requested-block preauth-data)))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status preauth-data) "pending") ERR_PREAUTH_ALREADY_USED)
+    (asserts! (<= blocks-elapsed PREAUTH_EXPIRY_BLOCKS) ERR_PREAUTH_EXPIRED)
+
+    (map-set preauthorizations
+      { preauth-id: preauth-id }
+      (merge preauth-data {
+        status: "approved",
+        approved-amount: approved-amount,
+        reviewed-by: (some tx-sender)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (deny-preauthorization (preauth-id uint))
+  (let
+    (
+      (preauth-data (unwrap! (map-get? preauthorizations { preauth-id: preauth-id }) ERR_PREAUTH_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status preauth-data) "pending") ERR_PREAUTH_ALREADY_USED)
+
+    (map-set preauthorizations
+      { preauth-id: preauth-id }
+      (merge preauth-data {
+        status: "denied",
+        reviewed-by: (some tx-sender)
+      })
+    )
+
+    (map-set policy-preauths
+      { policy-id: (get policy-id preauth-data), preauth-id: preauth-id }
+      { active: false }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-preauthorization (preauth-id uint))
+  (map-get? preauthorizations { preauth-id: preauth-id })
+)
+
+(define-read-only (is-preauth-valid (preauth-id uint))
+  (match (map-get? preauthorizations { preauth-id: preauth-id })
+    preauth-data
+    (let
+      (
+        (blocks-elapsed (- stacks-block-height (get requested-block preauth-data)))
+      )
+      (and
+        (is-eq (get status preauth-data) "approved")
+        (<= blocks-elapsed PREAUTH_EXPIRY_BLOCKS)
+      )
+    )
     false
   )
 )
